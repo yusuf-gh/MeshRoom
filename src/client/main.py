@@ -4,29 +4,29 @@ from src.utils import calculate_checksum, generate_anonymous_nickname
 
 
 def discover_server_ip() -> str:
-    """Функция автообнаружения сервера в локальной сети через UDP Broadcast (фикс опечаток)"""
     UDP_PORT = 55556
     print("📡 [Discovery] Scanning local network for MeshRoom server...")
 
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    udp_socket.settimeout(2.0)
-
     try:
-        # Узнаем свой локальный IP-адрес
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip_str = s.getsockname()[0]
         s.close()
 
         ip_parts = local_ip_str.split('.')
+        base_subnet = '.'.join(ip_parts[:-1])
         ip_parts[-1] = '255'
         subnet_broadcast = '.'.join(ip_parts)
     except Exception:
         subnet_broadcast = "255.255.255.255"
+        base_subnet = ""
+
+
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_socket.settimeout(0.5)
 
     try:
-        # Отправляем сигналы по всем направлениям (включая локалхост для теста)
         targets = [subnet_broadcast, "255.255.255.255", "127.0.0.1"]
         for target in targets:
             try:
@@ -34,32 +34,64 @@ def discover_server_ip() -> str:
             except Exception:
                 pass
 
-        # Ждем ответ от сервера
         data, addr = udp_socket.recvfrom(1024)
         if data == b"MESHROOM_HERE":
-            # ИСПРАВЛЕНО: извлекаем строку IP-адреса из кортежа addr
             server_ip = addr[0]
-
-            # Если сервер ответил с локалхоста, подменяем на реальный IP для ICMP
             if server_ip == "127.0.0.1":
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(("8.8.8.8", 80))
-                    server_ip = s.getsockname()[0]
-                    s.close()
-                except Exception:
-                    pass
-
-            print(f"🎯 [Discovery] Found server automatically at: {server_ip}")
+                server_ip = local_ip_str
+            print(f"🎯 [Discovery] Found server automatically via UDP: {server_ip}")
+            udp_socket.close()
             return server_ip
-
-    except socket.timeout:
-        print("⚠️ [Discovery] Auto-discovery timeout. Server not found.")
-    except Exception as e:
-        print(f"⚠️ [Discovery] Scan error: {e}")
+    except (socket.timeout, Exception):
+        pass
     finally:
         udp_socket.close()
 
+    if base_subnet:
+        print("🕵️‍♂️ [Discovery] UDP Broadcast blocked by OS. Switching to covert ICMP sweep...")
+        try:
+            ICMP_CODE = socket.getprotobyname('icmp')
+
+            scan_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+            scan_socket.settimeout(0.1)
+
+
+            payload = b"MESHROOM_DISCOVER"
+            header = struct.pack('bbHHh', 8, 0, 0, 999, 1)
+            my_checksum = calculate_checksum(header + payload)
+            final_header = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 999, 1)
+            packet = final_header + payload
+
+
+            for i in range(1, 51):
+                target_ip = f"{base_subnet}.{i}"
+                try:
+                    scan_socket.sendto(packet, (target_ip, 0))
+                except Exception:
+                    pass
+
+
+            scan_socket.settimeout(1.0)
+            while True:
+                recv_packet, addr = scan_socket.recvfrom(2048)
+                actual_ip = addr[0] if isinstance(addr, tuple) else addr
+
+                offset = 20 if len(recv_packet) >= 28 else 0
+                icmp_header = recv_packet[offset:offset + 8]
+                if len(icmp_header) < 8:
+                    continue
+
+                icmp_type, code, checksum, packet_id, sequence = struct.unpack('bbHHh', icmp_header)
+
+
+                if icmp_type == 0 and recv_packet[offset + 8:] == payload:
+                    print(f"🎯 [Discovery] Found server automatically via ICMP Sweep: {actual_ip}")
+                    scan_socket.close()
+                    return actual_ip
+        except Exception as e:
+            print(f"⚠️ [Discovery] ICMP Sweep failed: {e}")
+
+    print("⚠️ [Discovery] Auto-discovery failed (Both UDP and ICMP blocked).")
     return ""
 
 
@@ -67,7 +99,10 @@ def listen_servers_pongs(client_socket, cipher, server_ip):
     while True:
         try:
             packet, addr = client_socket.recvfrom(2048)
-            actual_ip = addr if isinstance(addr, tuple) else addr
+            if isinstance(addr, tuple):
+                actual_ip = addr[0]
+            else:
+                actual_ip = addr
 
             if actual_ip == server_ip:
                 offset = 20 if len(packet) >= 28 else 0
@@ -129,6 +164,22 @@ def start_client():
     sequence = 0
 
     try:
+        join_text = f"📢 [{nickname}]: joined the session!"
+        encrypted_join_payload = cipher.encrypt(join_text.encode('utf-8'))
+
+        sequence += 1
+        join_initial_header = struct.pack('bbHHh', 8, 0, 0, packet_id, sequence)
+
+        join_checksum = calculate_checksum(join_initial_header + encrypted_join_payload)
+        join_final_header = struct.pack('bbHHh', 8, 0, socket.htons(join_checksum), packet_id, sequence)
+
+        client_socket.sendto(join_final_header + encrypted_join_payload, (server_ip, 0))
+
+    except Exception as e:
+        print(f"⚠️ Failed to send join notification: {e}")
+    # =======================================================
+
+    try:
         while True:
             text = input()
             if text.strip():
@@ -144,7 +195,21 @@ def start_client():
                 client_socket.sendto(final_header + encrypted_payload, (server_ip, 0))
 
     except KeyboardInterrupt:
-        print("\n🔌 Disconnected from anonymous session.")
+        try:
+            exit_text = f"📢 [{nickname}]: left the session!"
+            encrypted_exit_payload = cipher.encrypt(exit_text.encode('utf-8'))
+
+            sequence += 1
+            exit_initial_header = struct.pack('bbHHh', 8, 0, 0, packet_id, sequence)
+
+            exit_checksum = calculate_checksum(exit_initial_header + encrypted_exit_payload)
+            exit_final_header = struct.pack('bbHHh', 8, 0, socket.htons(exit_checksum), packet_id, sequence)
+
+            client_socket.sendto(exit_final_header + encrypted_exit_payload, (server_ip, 0))
+        except Exception:
+            pass
+
+        print("\n🔌 Disconnected from anonymous session. Tracks cleared.")
     finally:
         client_socket.close()
 

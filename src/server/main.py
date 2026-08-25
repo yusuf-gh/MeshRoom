@@ -43,7 +43,7 @@ def start_server():
 
         while True:
             packet, addr = server_socket.recvfrom(2048)
-            client_ip = addr[0]
+            client_ip = addr[0] if isinstance(addr, tuple) else addr
 
             offset = 20 if len(packet) >= 28 else 0
 
