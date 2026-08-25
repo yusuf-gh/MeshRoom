@@ -1,0 +1,11 @@
+altgraph==0.17.5
+cffi==2.1.1
+cmdkit==2.7.7
+cryptography==50.0.0
+macholib==1.16.4
+names_generator==0.4.0
+packaging==26.3
+pycparser==3.0
+pyinstaller==6.22.2пше
+pyinstaller-hooks-contrib==2026.7
+setuptools==84.0.0
