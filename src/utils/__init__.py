@@ -1,1 +1,2 @@
 from .checksum import calculate_checksum
+from .random_name import generate_anonymous_nickname

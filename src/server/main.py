@@ -1,5 +1,26 @@
 import socket
 import struct
+import threading
+
+def udp_beacon_listener():
+    UDP_PORT = 55556
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_socket.bind("0.0.0.0", UDP_PORT)
+
+        while True:
+            data, addr = udp_socket.recvfrom(1024)
+            if data == b"MESHROOM_DISCOVER":
+                udp_socket.sendto(b"MESHROOM_HERE", addr)
+
+    except Exception:
+        pass
+
+    finally:
+        udp_socket.close()
+
 
 
 def start_server():
@@ -16,6 +37,9 @@ def start_server():
         print(f"🚀 [SERVER] started\n"
               f"⏳  Waiting for hidden nodes...\n"
               f"📍 Server is blind: all the date as well as the traffic is secured\n")
+
+        udp_thread = threading.Thread(target=udp_beacon_listener, daemon=True)
+        udp_thread.start()
 
         while True:
             packet, addr = server_socket.recvfrom(2048)
@@ -40,7 +64,7 @@ def start_server():
                 for other_ip in known_clients:
                     if other_ip != client_ip:
                         try:
-                            reply_header = struct.pack('ddHHh', 0, 0, 0, packet_id, sequence)
+                            reply_header = struct.pack('bbHHh', 0, 0, 0, packet_id, sequence)
                             server_socket.sendto(reply_header + payload, (other_ip, 0))
                         except Exception:
                             pass
