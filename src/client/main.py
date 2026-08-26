@@ -2,11 +2,15 @@ import socket, struct, threading, sys, hashlib, base64
 from cryptography.fernet import Fernet
 from src.utils import calculate_checksum, generate_anonymous_nickname
 
+import time
+
 
 def discover_server_ip() -> str:
+    """Функция автообнаружения сервера в локальной сети (Умный пачечный ICMP-сканер)"""
     UDP_PORT = 55556
     print("📡 [Discovery] Scanning local network for MeshRoom server...")
 
+    # --- 1. Узнаем свой локальный IP и базу подсети ---
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -14,84 +18,109 @@ def discover_server_ip() -> str:
         s.close()
 
         ip_parts = local_ip_str.split('.')
-        base_subnet = '.'.join(ip_parts[:-1])
+        base_subnet = '.'.join(ip_parts[:-1])  # Получим например "192.168.1"
         ip_parts[-1] = '255'
         subnet_broadcast = '.'.join(ip_parts)
     except Exception:
         subnet_broadcast = "255.255.255.255"
         base_subnet = ""
+        local_ip_str = "127.0.0.1"
 
-
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    udp_socket.settimeout(0.5)
-
-    try:
-        targets = [subnet_broadcast, "255.255.255.255", "127.0.0.1"]
-        for target in targets:
-            try:
-                udp_socket.sendto(b"MESHROOM_DISCOVER", (target, UDP_PORT))
-            except Exception:
-                pass
-
-        data, addr = udp_socket.recvfrom(1024)
-        if data == b"MESHROOM_HERE":
-            server_ip = addr[0]
-            if server_ip == "127.0.0.1":
-                server_ip = local_ip_str
-            print(f"🎯 [Discovery] Found server automatically via UDP: {server_ip}")
-            udp_socket.close()
-            return server_ip
-    except (socket.timeout, Exception):
-        pass
-    finally:
-        udp_socket.close()
-
+    # --- 2. Попытка через быструю отправку на свой же IP и шлюз роутера ---
     if base_subnet:
-        print("🕵️‍♂️ [Discovery] UDP Broadcast blocked by OS. Switching to covert ICMP sweep...")
+        print("🕵️‍♂️ [Discovery] Probing high-probability nodes first...")
         try:
             ICMP_CODE = socket.getprotobyname('icmp')
-
             scan_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
-            scan_socket.settimeout(0.1)
-
+            scan_socket.settimeout(0.3)
 
             payload = b"MESHROOM_DISCOVER"
             header = struct.pack('bbHHh', 8, 0, 0, 999, 1)
             my_checksum = calculate_checksum(header + payload)
-            final_header = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 999, 1)
-            packet = final_header + payload
+            packet = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 999, 1) + payload
 
+            # Приоритетные цели: твой ПК, роутер (.1), популярные адреса (.2, .3, .10, .27)
+            priority_ips = [local_ip_str, f"{base_subnet}.1", f"{base_subnet}.2", f"{base_subnet}.27",
+                            f"{base_subnet}.10"]
 
-            for i in range(1, 51):
-                target_ip = f"{base_subnet}.{i}"
+            for target_ip in priority_ips:
                 try:
                     scan_socket.sendto(packet, (target_ip, 0))
                 except Exception:
                     pass
 
+            # Быстро смотрим, ответил ли кто-то из них
+            start_time = time.time()
+            while time.time() - start_time < 0.8:
+                try:
+                    recv_packet, addr = scan_socket.recvfrom(2048)
+                    actual_ip = addr if isinstance(addr, tuple) else addr
+                    offset = 20 if len(recv_packet) >= 28 else 0
+
+                    icmp_header = recv_packet[offset:offset + 8]
+                    if len(icmp_header) < 8: continue
+                    icmp_type, _, _, _, _ = struct.unpack('bbHHh', icmp_header)
+
+                    if icmp_type == 0 and recv_packet[offset + 8:] == payload:
+                        clean_ip = actual_ip[0] if isinstance(actual_ip, tuple) else actual_ip
+                        print(f"🎯 [Discovery] Found server automatically on priority node: {clean_ip}")
+                        scan_socket.close()
+                        return clean_ip
+                except socket.timeout:
+                    break
+            scan_socket.close()
+        except Exception:
+            pass
+
+    # --- 3. Медленный веерный обход пачками (если приоритетные цели промолчали) ---
+    if base_subnet:
+        print("🕵️‍♂️ [Discovery] Switching to multi-batch ICMP sweep...")
+        try:
+            ICMP_CODE = socket.getprotobyname('icmp')
+            scan_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+
+            payload = b"MESHROOM_DISCOVER"
+            header = struct.pack('bbHHh', 8, 0, 0, 999, 1)
+            my_checksum = calculate_checksum(header + payload)
+            packet = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 999, 1) + payload
+
+            # Сканируем пулами по 5 адресов с микропаузой 0.05 сек, чтобы роутер не сходил с ума
+            for i in range(1, 51):
+                target_ip = f"{base_subnet}.{i}"
+                if target_ip in priority_ips: continue  # Пропускаем то, что уже пинговали
+
+                try:
+                    scan_socket.sendto(packet, (target_ip, 0))
+                except Exception:
+                    pass
+
+                if i % 5 == 0:
+                    time.sleep(0.05)  # Даем роутеру передохнуть
 
             scan_socket.settimeout(1.0)
-            while True:
-                recv_packet, addr = scan_socket.recvfrom(2048)
-                actual_ip = addr[0] if isinstance(addr, tuple) else addr
+            start_time = time.time()
+            while time.time() - start_time < 1.5:
+                try:
+                    recv_packet, addr = scan_socket.recvfrom(2048)
+                    actual_ip = addr if isinstance(addr, tuple) else addr
+                    offset = 20 if len(recv_packet) >= 28 else 0
 
-                offset = 20 if len(recv_packet) >= 28 else 0
-                icmp_header = recv_packet[offset:offset + 8]
-                if len(icmp_header) < 8:
-                    continue
+                    icmp_header = recv_packet[offset:offset + 8]
+                    if len(icmp_header) < 8: continue
+                    icmp_type, _, _, _, _ = struct.unpack('bbHHh', icmp_header)
 
-                icmp_type, code, checksum, packet_id, sequence = struct.unpack('bbHHh', icmp_header)
-
-
-                if icmp_type == 0 and recv_packet[offset + 8:] == payload:
-                    print(f"🎯 [Discovery] Found server automatically via ICMP Sweep: {actual_ip}")
-                    scan_socket.close()
-                    return actual_ip
+                    if icmp_type == 0 and recv_packet[offset + 8:] == payload:
+                        clean_ip = actual_ip[0] if isinstance(actual_ip, tuple) else actual_ip
+                        print(f"🎯 [Discovery] Found server automatically via batch sweep: {clean_ip}")
+                        scan_socket.close()
+                        return clean_ip
+                except socket.timeout:
+                    break
+            scan_socket.close()
         except Exception as e:
             print(f"⚠️ [Discovery] ICMP Sweep failed: {e}")
 
-    print("⚠️ [Discovery] Auto-discovery failed (Both UDP and ICMP blocked).")
+    print("⚠️ [Discovery] Auto-discovery failed (Network Congestion).")
     return ""
 
 
